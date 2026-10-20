@@ -151,6 +151,7 @@ struct pri_context {
 
 static void gprs_netreg_update(struct ofono_gprs *gprs);
 static void gprs_deactivate_next(struct ofono_gprs *gprs);
+static void pri_context_signal_active(struct pri_context *ctx);
 static void write_context_settings(struct ofono_gprs *gprs,
 						struct pri_context *context);
 
@@ -1170,6 +1171,54 @@ static void pri_activate_callback(const struct ofono_error *error, void *data)
 					"Active", DBUS_TYPE_BOOLEAN, &value);
 }
 
+/*
+ * RoamingAllowed is about data roaming: while roaming it keeps internet,
+ * MMS and WAP contexts down, but not the packet attach itself. IMS (VoLTE,
+ * SMS over IMS) needs the attach, and on LTE-only networks it is the only
+ * voice service there is.
+ */
+static ofono_bool_t gprs_roaming_blocks(struct ofono_gprs *gprs,
+					enum ofono_gprs_context_type type)
+{
+	return type != OFONO_GPRS_CONTEXT_TYPE_IMS && !gprs->roaming_allowed &&
+		gprs->status == NETWORK_REGISTRATION_STATUS_ROAMING;
+}
+
+static void pri_roaming_deactivate_cb(const struct ofono_error *error,
+					void *data)
+{
+	struct pri_context *ctx = data;
+
+	if (error->type != OFONO_ERROR_TYPE_NO_ERROR) {
+		ofono_warn("Deactivating %s while roaming failed: %s",
+				ctx->path, telephony_error_to_str(error));
+		return;
+	}
+
+	pri_reset_context_settings(ctx);
+	release_context(ctx);
+	pri_context_signal_active(ctx);
+}
+
+/* Take down the contexts that RoamingAllowed no longer allows */
+static void gprs_roaming_check_contexts(struct ofono_gprs *gprs)
+{
+	GSList *l;
+
+	for (l = gprs->contexts; l; l = l->next) {
+		struct pri_context *ctx = l->data;
+		struct ofono_gprs_context *gc = ctx->context_driver;
+
+		if (!ctx->active || ctx->pending || gc == NULL ||
+				!gprs_roaming_blocks(gprs, ctx->type))
+			continue;
+
+		ofono_info("Roaming not allowed, deactivating %s", ctx->path);
+		gc->driver->deactivate_primary(gc, ctx->context.cid,
+					pri_roaming_deactivate_cb, ctx);
+	}
+}
+
 static void pri_deactivate_callback(const struct ofono_error *error, void *data)
 {
 	struct pri_context *ctx = data;
@@ -1260,6 +1309,9 @@ static void pri_read_settings_callback(const struct ofono_error *error,
 
 	gprs->driver_attached = TRUE;
 	gprs_set_attached_property(gprs, TRUE);
+
+	/* A network-initiated context may be one roaming doesn't allow */
+	gprs_roaming_check_contexts(gprs);
 
 	ofono_dbus_signal_property_changed(conn, pri_ctx->path,
 					OFONO_CONNECTION_CONTEXT_INTERFACE,
@@ -1632,6 +1684,9 @@ static DBusMessage *pri_set_property(DBusConnection *conn,
 
 		if (value && !ctx->gprs->attached)
 			return __ofono_error_not_attached(msg);
+
+		if (value && gprs_roaming_blocks(ctx->gprs, ctx->type))
+			return __ofono_error_not_allowed(msg);
 
 		if (ctx->gprs->flags & GPRS_FLAG_ATTACHING)
 			return __ofono_error_attach_in_progress(msg);
@@ -2079,8 +2134,8 @@ static void gprs_netreg_update(struct ofono_gprs *gprs)
 
 	attach = gprs->netreg_status == NETWORK_REGISTRATION_STATUS_REGISTERED;
 
-	attach = attach || (gprs->roaming_allowed &&
-		gprs->netreg_status == NETWORK_REGISTRATION_STATUS_ROAMING);
+	attach = attach ||
+		gprs->netreg_status == NETWORK_REGISTRATION_STATUS_ROAMING;
 
 	attach = attach && gprs->powered;
 
@@ -2232,6 +2287,7 @@ static DBusMessage *gprs_set_property(DBusConnection *conn,
 		}
 
 		gprs_netreg_update(gprs);
+		gprs_roaming_check_contexts(gprs);
 	} else if (!strcmp(property, "Powered")) {
 		if (gprs->driver->set_attached == NULL)
 			return __ofono_error_not_implemented(msg);
@@ -3047,12 +3103,9 @@ void ofono_gprs_status_notify(struct ofono_gprs *gprs, int status)
 	if (gprs->powered == FALSE)
 		goto detach;
 
-	if (gprs->roaming_allowed == FALSE &&
-			status == NETWORK_REGISTRATION_STATUS_ROAMING)
-		goto detach;
-
 	gprs->driver_attached = TRUE;
 	gprs_attached_update(gprs);
+	gprs_roaming_check_contexts(gprs);
 
 	return;
 
